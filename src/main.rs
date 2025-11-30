@@ -1,5 +1,6 @@
 use base64::prelude::*;
 use itertools::Itertools;
+use rayon::prelude::*;
 use ruzstd::StreamingDecoder;
 
 use std::{io::BufRead, sync::Arc};
@@ -15,7 +16,7 @@ fn get_db() -> sled::Db {
     sled::open("skins.sled").unwrap()
 }
 
-async fn run_downloader() {
+async fn run_downloader(db: sled::Db) {
     let source_file = std::fs::File::open("mojang.jsonl.zst").unwrap();
     let source = std::io::BufReader::new(StreamingDecoder::new(source_file).unwrap());
 
@@ -41,18 +42,18 @@ async fn run_downloader() {
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(TASK_LIMIT));
 
-    let db = get_db();
-
-    // tokio::task::spawn({
-    //     let db = db.clone();
-    //     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(600));
-    //     async move {
-    //         loop {
-    //             interval.tick().await;
-    //             println!("Database has {} skins", db.len());
-    //         }
-    //     }
-    // });
+    tokio::task::spawn({
+        let mut prev_len = db.len();
+        let db = db.clone();
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        async move {
+            loop {
+                interval.tick().await;
+                println!("Downloaded {} skins in the last 30 seconds (~{} skins/sec)", db.len() - prev_len, (db.len() - prev_len) / 30);
+                prev_len = db.len();
+            }
+        }
+    });
 
     let connection = reqwest::Client::new();
 
@@ -133,13 +134,20 @@ fn export() {
             .prepare("INSERT INTO skins (id, skin) VALUES (?, ?)")
             .unwrap();
 
-        for entry in entry {
-            let (key, value) = entry.unwrap();
-            let key = std::str::from_utf8(&key).unwrap().to_string();
-            let value = value.to_vec();
-            let optimized_image =
-                oxipng::optimize_from_memory(&value, &oxipng::Options::from_preset(2)).unwrap();
+        let entry = entry.into_iter().collect::<Vec<_>>();
+        let entry = entry
+            .into_par_iter()
+            .map(|e| {
+                let (key, value) = e.unwrap();
+                let key = std::str::from_utf8(&key).unwrap().to_string();
+                let value = value.to_vec();
+                let optimized_image =
+                    oxipng::optimize_from_memory(&value, &oxipng::Options::from_preset(2)).unwrap();
+                (key, optimized_image)
+            })
+            .collect::<Vec<_>>();
 
+        for (key, optimized_image) in entry {
             match statement.execute((&key, optimized_image)) {
                 Ok(_) => {}
                 Err(e) => {
@@ -156,220 +164,100 @@ fn export() {
         println!("Exported {} skins", total * batch_size);
     }
 
-
     println!("Export done");
 }
 
-async fn run_downloader_direct() {
-    let source_file = std::fs::File::open("mojang.jsonl.zst").unwrap();
-    let source = std::io::BufReader::new(StreamingDecoder::new(source_file).unwrap());
-
-    let skin_id_iterator = source.lines().filter_map(|line| {
-        let line = line.unwrap();
-
-        let mojang_response: MojangResponse = serde_json::from_str(&line).unwrap();
-
-        let base64_decoded = base64::prelude::BASE64_STANDARD
-            .decode(mojang_response.properties[0].value.as_bytes())
-            .unwrap();
-        let base64_decoded_str = String::from_utf8(base64_decoded).unwrap();
-
-        let textures: Textures = serde_json::from_str(&base64_decoded_str).unwrap();
-
-        if let Some(skin) = textures.textures.skin {
-            let skin_id = skin.url.rsplit('/').next().unwrap();
-            Some(skin_id.to_owned())
-        } else {
-            None
-        }
-    });
-
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(TASK_LIMIT));
-    let connection = reqwest::Client::new();
-
-    // Create SQLite database and table (creates file if it doesn't exist)
-    println!("Creating/opening SQLite database: skins.sqlite");
-    let sqlite_db = Arc::new(tokio::sync::Mutex::new(
-        rusqlite::Connection::open("skins.sqlite")
-            .expect("Failed to create/open SQLite database file")
+async fn live_export(source_db: sled::Db) {
+    let target_db = Arc::new(std::sync::Mutex::new(
+        rusqlite::Connection::open("skins.sqlite").unwrap(),
     ));
-    
+
+    // Create the table
     {
-        let db = sqlite_db.lock().await;
+        let db = target_db.lock().unwrap();
         db.execute(
             "CREATE TABLE IF NOT EXISTS skins (id TEXT PRIMARY KEY, skin BLOB)",
             [],
         )
-        .expect("Failed to create skins table");
-        // Enable WAL mode for better concurrent performance
-        db.execute("PRAGMA journal_mode=WAL", []).unwrap();
-        // Increase cache size for better performance
-        db.execute("PRAGMA cache_size=10000", []).unwrap();
-        println!("Database initialized successfully");
+        .unwrap();
     }
 
-    // Create a channel for batching database operations
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(1000);
-    
-    // Spawn a dedicated database writer task
-    let db_writer = {
-        let sqlite_db = sqlite_db.clone();
-        tokio::spawn(async move {
-            let mut batch = Vec::new();
-            const BATCH_SIZE: usize = 50;
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
-            
-            loop {
-                tokio::select! {
-                    // Receive new items to add to batch
-                    Some((skin_id, optimized_image)) = rx.recv() => {
-                        batch.push((skin_id, optimized_image));
-                        
-                        // Process batch when it's full
-                        if batch.len() >= BATCH_SIZE {
-                            process_batch(&sqlite_db, &mut batch).await;
-                        }
-                    }
-                    // Process remaining items on timer
-                    _ = interval.tick() => {
-                        if !batch.is_empty() {
-                            process_batch(&sqlite_db, &mut batch).await;
-                        }
-                    }
-                    // Channel closed, process remaining and exit
-                    else => {
-                        if !batch.is_empty() {
-                            process_batch(&sqlite_db, &mut batch).await;
-                        }
-                        break;
-                    }
-                }
-            }
-        })
-    };
+    let mut processed_keys = std::collections::HashSet::new();
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
 
-    // Pre-load existing skin IDs into a HashSet for fast lookups
-    let existing_skins = {
-        let db = sqlite_db.lock().await;
-        let mut stmt = db.prepare("SELECT id FROM skins").unwrap();
-        let rows = stmt.query_map([], |row| {
-            row.get::<_, String>(0)
-        }).unwrap();
-        
-        let mut set = std::collections::HashSet::new();
-        for row in rows {
-            set.insert(row.unwrap());
+    println!("Starting live export and optimization...");
+
+    loop {
+        interval.tick().await;
+
+        // Collect new keys that haven't been processed yet
+        let new_entries: Vec<_> = source_db
+            .iter()
+            .filter_map(|entry| {
+                let (key, value) = entry.ok()?;
+                let key_str = std::str::from_utf8(&key).ok()?.to_string();
+                if !processed_keys.contains(&key_str) {
+                    Some((key_str, value.to_vec()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if new_entries.is_empty() {
+            continue;
         }
-        println!("Loaded {} existing skins into memory", set.len());
-        Arc::new(tokio::sync::RwLock::new(set))
-    };
 
-    // Download tasks - similar to original but with batched database writes
-    for skin_id in skin_id_iterator {
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let connection = connection.clone();
-        let tx = tx.clone();
-        let existing_skins = existing_skins.clone();
-        
-        tokio::spawn(async move {
-            // Quick check if skin already exists (no database lock needed)
-            {
-                let existing = existing_skins.read().await;
-                if existing.contains(&skin_id) {
-                    drop(permit);
-                    return;
+        println!(
+            "Processing {} new skins for optimization and export",
+            new_entries.len()
+        );
+
+        // Process entries in parallel using rayon
+        let optimized_entries: Vec<_> = new_entries
+            .into_par_iter()
+            .filter_map(|(key, value)| {
+                match oxipng::optimize_from_memory(&value, &oxipng::Options::from_preset(2)) {
+                    Ok(optimized) => Some((key, optimized)),
+                    Err(e) => {
+                        println!("Failed to optimize skin {}: {}, using original", key, e);
+                        Some((key, value)) // Fall back to original
+                    }
                 }
+            })
+            .collect();
+
+        // Insert optimized entries into SQLite in batches
+        if !optimized_entries.is_empty() {
+            let db = target_db.clone();
+            let batch_size = 1000;
+
+            for chunk in optimized_entries.chunks(batch_size) {
+                let mut db = db.lock().unwrap();
+                let transaction = db.transaction().unwrap();
+
+                let mut statement = transaction
+                    .prepare("INSERT OR IGNORE INTO skins (id, skin) VALUES (?, ?)")
+                    .unwrap();
+
+                for (key, optimized_data) in chunk {
+                    if let Err(e) = statement.execute((key, optimized_data)) {
+                        println!("Failed to insert skin {}: {}", key, e);
+                    } else {
+                        processed_keys.insert(key.clone());
+                    }
+                }
+
+                drop(statement);
+                transaction.commit().unwrap();
             }
 
-            let skin_url = format!("{}{}", STRING_PREFIX, skin_id);
-            let response = match connection.get(&skin_url).send().await {
-                Ok(resp) => resp,
-                Err(_) => {
-                    drop(permit);
-                    return;
-                }
-            };
-            
-            if !response.status().is_success() {
-                drop(permit);
-                return;
-            }
-            
-            let skin_bytes = match response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    drop(permit);
-                    return;
-                }
-            };
-            
-            let skin_vec = skin_bytes.to_vec();
-
-            // Optimize the image before storing
-            let optimized_image = match oxipng::optimize_from_memory(&skin_vec, &oxipng::Options::from_preset(2)) {
-                Ok(img) => img,
-                Err(_) => {
-                    drop(permit);
-                    return;
-                }
-            };
-
-            // Add to existing skins set and send to database writer
-            {
-                let mut existing = existing_skins.write().await;
-                existing.insert(skin_id.clone());
-            }
-            
-            // Send to database writer (non-blocking)
-            if tx.send((skin_id, optimized_image)).await.is_err() {
-                // Channel closed
-            }
-
-            // Much shorter delay - similar to original
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-            drop(permit);
-        });
-    }
-
-    // Close the channel to signal database writer to finish
-    drop(tx);
-    
-    // Wait for all download tasks to complete
-    drop(semaphore.acquire_many(TASK_LIMIT as u32).await.unwrap());
-    
-    // Wait for database writer to finish
-    db_writer.await.unwrap();
-
-    // Get final count
-    let db = sqlite_db.lock().await;
-    let mut stmt = db.prepare("SELECT COUNT(*) FROM skins").unwrap();
-    let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
-    
-    println!("Direct download complete! Total skins in database: {}", count);
-}
-
-async fn process_batch(
-    sqlite_db: &Arc<tokio::sync::Mutex<rusqlite::Connection>>, 
-    batch: &mut Vec<(String, Vec<u8>)>
-) {
-    if batch.is_empty() {
-        return;
-    }
-    
-    let mut db = sqlite_db.lock().await;
-    let transaction = db.transaction().unwrap();
-    let mut stmt = transaction.prepare("INSERT OR IGNORE INTO skins (id, skin) VALUES (?, ?)").unwrap();
-    
-    for (skin_id, optimized_image) in batch.drain(..) {
-        if let Err(e) = stmt.execute((&skin_id, &optimized_image)) {
-            eprintln!("Failed to insert skin {}: {}", skin_id, e);
+            println!(
+                "Exported {} optimized skins. Total processed: {}",
+                optimized_entries.len(),
+                processed_keys.len()
+            );
         }
-    }
-    
-    drop(stmt);
-    if let Err(e) = transaction.commit() {
-        eprintln!("Failed to commit transaction: {}", e);
     }
 }
 
@@ -380,17 +268,28 @@ async fn main() {
         None => {
             println!("Usage: skin_downloader <option>");
             println!("Options:");
-            println!("  download       - Download skins to sled database");
-            println!("  download-direct - Download skins directly to SQLite database");
-            println!("  validate       - Validate skins in the database");
-            println!("  export         - Export skins from sled to SQLite");
+            println!("  download              - Download skins to sled database");
+            println!("  download-and-export   - Download skins while simultaneously optimizing and exporting to SQLite");
+            println!("  validate              - Validate skins in the database");
+            println!("  export                - Export skins from sled to SQLite");
             panic!("No option provided");
         }
     };
     if option == "download" {
-        run_downloader().await;
-    } else if option == "download-direct" {
-        run_downloader_direct().await;
+        run_downloader(get_db()).await;
+    } else if option == "download-and-export" {
+        let db = get_db();
+
+        // Start the live export task
+        let export_handle = tokio::spawn(live_export(db.clone()));
+
+        // Start downloading
+        run_downloader(db).await;
+
+        // Keep the export running for a bit longer to catch any final skins
+        println!("Download complete, waiting for final optimizations...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        export_handle.abort();
     } else if option == "validate" {
         validate_and_print_db();
     } else if option == "export" {
